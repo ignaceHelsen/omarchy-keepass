@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "id": "ignace.keepass",
+  "name": "KeePass",
+  "version": "1.1.0",
+  "author": "Ignace Helsen",
+  "description": "Search the KeePass database from the bar and copy a password to the clipboard; unlocks once and re-locks after an idle timeout",
+  "homepage": "https://github.com/ignacehelsen/omarchy-keepass",
+  "repository": "https://github.com/ignacehelsen/omarchy-keepass",
+  "license": "MIT",
+  "keywords": [
+    "keepass",
+    "kdbx",
+    "password",
+    "passwords",
+    "clipboard"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "KeepassPanel.qml"
+  },
+  "barWidget": {
+    "displayName": "KeePass",
+    "description": "Search entries and copy passwords without opening the KeePass app",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "dbPath": "~/Database.kdbx",
+      "keyfile": "",
+      "idleTimeout": 600,
+      "clearAfter": 20
+    },
+    "schema": [
+      {
+        "key": "dbPath",
+        "type": "path",
+        "label": "Database file",
+        "defaultValue": "~/Database.kdbx",
+        "description": "The .kdbx file to open. A leading ~ is expanded. The database is only ever read, and it is read in a helper process that forgets it again after the idle timeout."
+      },
+      {
+        "key": "keyfile",
+        "type": "path",
+        "label": "Key file",
+        "defaultValue": "",
+        "description": "Optional second factor, for databases protected by a key file as well as a master password. Leave empty when the database uses a password alone."
+      },
+      {
+        "key": "idleTimeout",
+        "type": "integer",
+        "label": "Lock again after",
+        "min": 30,
+        "max": 86400,
+        "step": 30,
+        "defaultValue": 600,
+        "description": "Seconds of inactivity before the helper drops the decrypted database and the master password is needed again. The timer restarts on every lookup, so a working session stays unlocked."
+      },
+      {
+        "key": "clearAfter",
+        "type": "integer",
+        "label": "Clear the clipboard after",
+        "min": 0,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 20,
+        "description": "Seconds a copied password stays on the clipboard before it is scrubbed, and only if nothing else has copied over it since. 0 leaves it there, which is the answer only if something else on the machine already manages that."
+      }
+    ]
+  }
+}

@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""Backing store for the ignace.keepass bar widget.
+
+Splits into a short-lived client (what the QML Process calls) and a detached
+daemon that holds the decrypted database in memory. The client never sees the
+master password after handing it over, and the daemon forgets everything once
+the idle timer runs out, so a single unlock covers a burst of lookups without
+leaving the database open all day.
+
+Secrets only ever travel over stdin or the unix socket -- never argv, which is
+world-readable in /proc.
+
+    kp-agent [--db PATH] [--keyfile PATH] [--timeout S] [--clear-after S] CMD
+
+    status              -> {"unlocked": bool, "remaining": int, "db": str}
+    unlock              -> {"ok": bool, "error": str}   password on stdin
+    search QUERY        -> {"ok": bool, "results": [...]}
+    copy UUID [FIELD]   -> {"ok": bool}
+    lock                -> {"ok": true}
+"""
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+SOCKET_PATH = os.path.join(RUNTIME, "omarchy-keepass.sock")
+DEFAULT_DB = os.path.expanduser("~/Database.kdbx")
+
+
+# --------------------------------------------------------------------------
+# daemon
+# --------------------------------------------------------------------------
+
+class Vault:
+    """Holds the open database and the timers that eventually close it."""
+
+    def __init__(self, db, keyfile, timeout, clear_after):
+        self.db = db
+        self.keyfile = keyfile or None
+        self.timeout = timeout
+        self.clear_after = clear_after
+        self.kp = None
+        self.touched = time.monotonic()
+        self.lock = threading.Lock()
+        self.clip_timer = None
+        self.clip_value = None
+
+    # -- lifetime ----------------------------------------------------------
+
+    def touch(self):
+        self.touched = time.monotonic()
+
+    def remaining(self):
+        if self.kp is None:
+            return 0
+        return max(0, int(self.timeout - (time.monotonic() - self.touched)))
+
+    def expired(self):
+        return self.kp is not None and self.remaining() <= 0
+
+    def forget(self):
+        """Drop the database and scrub anything we put on the clipboard."""
+        self.kp = None
+        if self.clip_timer:
+            self.clip_timer.cancel()
+            self.clip_timer = None
+        self.clear_clipboard()
+
+    # -- clipboard ---------------------------------------------------------
+
+    def copy_to_clipboard(self, value):
+        subprocess.run(["wl-copy"], input=value.encode(), check=True)
+        self.clip_value = value
+        if self.clip_timer:
+            self.clip_timer.cancel()
+        self.clip_timer = threading.Timer(self.clear_after, self.clear_clipboard)
+        self.clip_timer.daemon = True
+        self.clip_timer.start()
+
+    def clear_clipboard(self):
+        """Wipe the clipboard, but only if it still holds what we put there.
+
+        Clobbering whatever the user copied in the meantime would be worse
+        than leaving a password sitting one paste away.
+        """
+        if self.clip_value is None:
+            return
+        try:
+            current = subprocess.run(
+                ["wl-paste", "-n"], capture_output=True, timeout=5
+            ).stdout.decode(errors="replace")
+        except Exception:
+            current = None
+        if current == self.clip_value:
+            subprocess.run(["wl-copy", "--clear"], check=False)
+        self.clip_value = None
+
+    # -- commands ----------------------------------------------------------
+
+    def handle(self, req):
+        cmd = req.get("cmd")
+
+        if self.expired():
+            self.forget()
+
+        # Config travels with each request: a long-lived daemon must follow
+        # shell.json rather than the arguments it happened to spawn with.
+        if req.get("timeout"):
+            self.timeout = int(req["timeout"])
+        if req.get("clearAfter"):
+            self.clear_after = int(req["clearAfter"])
+
+        # While locked there is nothing to invalidate, so a client asking for a
+        # different database (shell.json edited since we spawned) just retargets
+        # us rather than getting answers about the old one.
+        if self.kp is None and req.get("db"):
+            self.db = req["db"]
+            self.keyfile = req.get("keyfile") or None
+
+        if cmd == "status":
+            return {
+                "unlocked": self.kp is not None,
+                "remaining": self.remaining(),
+                "db": self.db,
+                "exists": os.path.exists(self.db),
+            }
+
+        if cmd == "lock":
+            self.forget()
+            return {"ok": True}
+
+        if cmd == "unlock":
+            if not os.path.exists(self.db):
+                return {"ok": False, "error": "No database at %s" % self.db}
+            try:
+                from pykeepass import PyKeePass
+                from pykeepass.exceptions import CredentialsError
+            except ImportError:
+                return {"ok": False, "error": "python-pykeepass is not installed"}
+            try:
+                self.kp = PyKeePass(
+                    self.db, password=req.get("password") or None, keyfile=self.keyfile
+                )
+            except CredentialsError:
+                self.kp = None
+                return {"ok": False, "error": "Wrong password"}
+            except Exception as exc:
+                self.kp = None
+                return {"ok": False, "error": str(exc)[:200]}
+            self.touch()
+            return {"ok": True}
+
+        if self.kp is None:
+            return {"ok": False, "locked": True, "error": "Locked"}
+
+        self.touch()
+
+        if cmd == "search":
+            return {"ok": True, "results": self.search(req.get("q") or "")}
+
+        if cmd == "copy":
+            return self.copy(req.get("uuid"), req.get("field") or "password")
+
+        return {"ok": False, "error": "Unknown command %r" % cmd}
+
+    def search(self, query, limit=40):
+        q = query.strip().lower()
+        scored = []
+        for entry in self.kp.entries:
+            title = entry.title or ""
+            username = entry.username or ""
+            url = entry.url or ""
+            if not q:
+                score = 0
+            elif title.lower().startswith(q):
+                score = 0
+            elif q in title.lower():
+                score = 1
+            elif q in username.lower():
+                score = 2
+            elif q in url.lower():
+                score = 3
+            elif q in "/".join(entry.group.path or []).lower():
+                score = 4
+            else:
+                continue
+            scored.append((score, title.lower(), {
+                "uuid": str(entry.uuid),
+                "title": title or "(untitled)",
+                "username": username,
+                "url": url,
+                "group": "/".join(entry.group.path or []),
+                "hasPassword": bool(entry.password),
+            }))
+        scored.sort(key=lambda row: (row[0], row[1]))
+        return [row[2] for row in scored[:limit]]
+
+    def copy(self, uuid, field):
+        import uuid as uuidlib
+        try:
+            wanted = uuidlib.UUID(str(uuid))
+        except ValueError:
+            return {"ok": False, "error": "Bad entry id"}
+        entry = next((e for e in self.kp.entries if e.uuid == wanted), None)
+        if entry is None:
+            return {"ok": False, "error": "Entry not found"}
+        value = {"password": entry.password, "username": entry.username,
+                 "url": entry.url}.get(field)
+        if not value:
+            return {"ok": False, "error": "Entry has no %s" % field}
+        try:
+            self.copy_to_clipboard(value)
+        except Exception as exc:
+            return {"ok": False, "error": "Clipboard failed: %s" % exc}
+        return {"ok": True, "field": field, "clearAfter": self.clear_after}
+
+
+def serve(args):
+    vault = Vault(args.db, args.keyfile, args.timeout, args.clear_after)
+
+    # A socket left behind by a killed daemon would block bind(); one with a
+    # live daemon behind it means we lost the spawn race and should bow out.
+    if os.path.exists(SOCKET_PATH):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(SOCKET_PATH)
+            probe.close()
+            return 0
+        except OSError:
+            os.unlink(SOCKET_PATH)
+        finally:
+            probe.close()
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_umask = os.umask(0o077)
+    try:
+        server.bind(SOCKET_PATH)
+    except OSError:
+        return 0
+    finally:
+        os.umask(old_umask)
+    server.listen(8)
+    server.settimeout(5)
+
+    try:
+        while True:
+            # Wake up regularly even with no traffic so the idle timeout is
+            # honoured while the user is off doing something else.
+            if vault.expired():
+                vault.forget()
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            with conn, vault.lock:
+                try:
+                    conn.settimeout(30)
+                    payload = conn.makefile("r").readline()
+                    reply = vault.handle(json.loads(payload))
+                except Exception as exc:
+                    reply = {"ok": False, "error": str(exc)[:200]}
+                try:
+                    conn.sendall((json.dumps(reply) + "\n").encode())
+                except OSError:
+                    pass
+            if vault.kp is None:
+                break
+    finally:
+        vault.forget()
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+    return 0
+
+
+# --------------------------------------------------------------------------
+# client
+# --------------------------------------------------------------------------
+
+def connect():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(30)
+    sock.connect(SOCKET_PATH)
+    return sock
+
+
+def spawn_daemon(args):
+    cmd = [sys.executable, os.path.abspath(__file__), "--db", args.db,
+           "--timeout", str(args.timeout), "--clear-after", str(args.clear_after),
+           "--daemon"]
+    if args.keyfile:
+        cmd[3:3] = ["--keyfile", args.keyfile]
+    subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            return connect()
+        except OSError:
+            time.sleep(0.05)
+    return None
+
+
+def request(args, payload):
+    try:
+        sock = connect()
+    except OSError:
+        sock = spawn_daemon(args)
+        if sock is None:
+            return {"ok": False, "unlocked": False, "error": "Agent did not start"}
+    try:
+        with sock:
+            sock.sendall((json.dumps(payload) + "\n").encode())
+            line = sock.makefile("r").readline()
+    except OSError:
+        line = ""
+    if line.strip():
+        return json.loads(line)
+
+    # The daemon retired mid-request; bring up a fresh one and ask again.
+    sock = spawn_daemon(args)
+    if sock is None:
+        return {"ok": False, "unlocked": False, "error": "Agent did not start"}
+    with sock:
+        sock.sendall((json.dumps(payload) + "\n").encode())
+        return json.loads(sock.makefile("r").readline() or "{}")
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--db", default=DEFAULT_DB)
+    parser.add_argument("--keyfile", default="")
+    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--clear-after", type=int, default=20)
+    parser.add_argument("--daemon", action="store_true")
+    parser.add_argument("cmd", nargs="?", default="status")
+    parser.add_argument("rest", nargs="*")
+    args = parser.parse_args()
+    args.db = os.path.expanduser(args.db or DEFAULT_DB)
+    args.keyfile = os.path.expanduser(args.keyfile) if args.keyfile else ""
+
+    if args.daemon:
+        return serve(args)
+
+    payload = {"cmd": args.cmd, "db": args.db, "keyfile": args.keyfile,
+               "timeout": args.timeout, "clearAfter": args.clear_after}
+    if args.cmd == "unlock":
+        # Master password over stdin so it stays out of the process table.
+        payload["password"] = sys.stdin.readline().rstrip("\n")
+    elif args.cmd == "search":
+        payload["q"] = args.rest[0] if args.rest else ""
+    elif args.cmd == "copy":
+        if not args.rest:
+            print(json.dumps({"ok": False, "error": "copy needs an entry id"}))
+            return 1
+        payload["uuid"] = args.rest[0]
+        payload["field"] = args.rest[1] if len(args.rest) > 1 else "password"
+
+    # `status` is the polling command, so it must never wake a sleeping agent:
+    # no socket simply means locked.
+    if args.cmd == "status" and not os.path.exists(SOCKET_PATH):
+        print(json.dumps({"unlocked": False, "remaining": 0, "db": args.db,
+                          "exists": os.path.exists(args.db)}))
+        return 0
+
+    print(json.dumps(request(args, payload)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

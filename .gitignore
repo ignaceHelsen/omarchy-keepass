@@ -1,0 +1,18 @@
+# A database in the tree is the one mistake there is no taking back once it is
+# pushed. The real one lives wherever dbPath points, and the throwaway used for
+# the screenshot is built outside the repo -- neither belongs in here.
+*.kdbx
+*.key
+*.keyx
+
+# Stale editor and rescue copies. A .bak of a panel is a second, older copy of
+# the plugin sitting in the tree, and the shell can be told to load it.
+*.bak
+*.bak.*
+*.orig
+*.rej
+*~
+
+*.local.*
+__pycache__/
+*.pyc
